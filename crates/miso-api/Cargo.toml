@@ -1,0 +1,57 @@
+[package]
+name = "miso-api"
+description = "REST API server for MISO LIMS using Axum"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "miso-server"
+path = "src/main.rs"
+
+[dependencies]
+# Internal
+miso-domain.workspace = true
+miso-application.workspace = true
+miso-infrastructure.workspace = true
+
+# Web Framework
+axum.workspace = true
+axum-extra.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+
+# Async runtime
+tokio.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Date/Time
+chrono.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Logging
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Validation
+validator.workspace = true
+
+# Configuration
+config.workspace = true
+dotenvy.workspace = true
+
+# JWT
+jsonwebtoken.workspace = true
+
+# Password hashing
+argon2.workspace = true
+

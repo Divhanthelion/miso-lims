@@ -1,0 +1,458 @@
+﻿Strategic Architecture & Implementation Directives: MISO LIMS Rust Modernization
+1. Situational Analysis and Strategic Imperative
+1.1 The Operational Context: MISO at the OICR
+The Managing Information for Sequencing Operations (MISO) Laboratory Information Management System (LIMS) represents the central nervous system for the Genome Sequence Informatics (GSI) group at the Ontario Institute for Cancer Research (OICR).1 As an open-source platform designed specifically for the rigorous demands of Next-Generation Sequencing (NGS) centers, MISO handles the intricate metadata associated with sample receipt, library preparation, pooling, and sequencing across diverse platforms including Illumina and Oxford Nanopore.3
+The current operational landscape of high-throughput genomics is characterized by an exponential increase in data velocity and volume. Sequencing centers are no longer merely "tracking samples"; they are orchestrating massive parallel workflows where the latency of metadata retrieval and the reliability of hardware integration (scanners, liquid handlers, sequencers) directly impact the facility's throughput.5 The legacy architecture of MISO—a monolithic Java application rooted in the Spring Framework and Hibernate ecosystem—has served its purpose admirably but is increasingly viewing the limits of its scalability and maintainability.7
+The mandate for this comprehensive technical report is to provide a complete situational awareness picture and a rigorous implementation blueprint for rewriting MISO in Rust. This is not a trivial port; it is a strategic re-platforming aimed at leveraging Rust's zero-cost abstractions, memory safety without garbage collection, and superior asynchronous concurrency models to build a LIMS capable of sustaining the next decade of genomic innovation. The target audience for this document includes the Lead Systems Architect and the engineering agents responsible for code generation, ensuring they possess the contextual nuance required to replicate MISO’s complex business logic while fundamentally upgrading its technological foundation.
+1.2 The Case for Rust in High-Fidelity Genomics
+The decision to transition from Java to Rust is driven by specific engineering constraints inherent to the LIMS domain. While Java offers a robust ecosystem, the nature of a LIMS involves bridging the gap between high-level web interfaces and low-level hardware interactions.
+Deterministic Resource Management
+The legacy MISO system runs on a Java Virtual Machine (JVM), likely utilizing standard garbage collection (GC) algorithms. In a high-throughput lab, a "stop-the-world" GC pause occurring while a technician is rapidly scanning a rack of 96 barcodes via a VisionMate scanner can lead to data loss or user frustration (the "laggy scanner" phenomenon).9 Rust’s ownership model ensures deterministic memory management. Memory is freed when it goes out of scope, eliminating GC pauses entirely. This is critical for the visionmate-client integration, where TCP/IP streams must be handled with real-time responsiveness.11
+Type-Driven Domain Safety
+Genomics workflows are state-heavy. A sample transitions through strict biological states: Received → Extracted → Library Prep → Pooled → Sequenced. In the Java implementation, these states are likely managed via runtime checks or string enums, susceptible to logic errors where a sample might be "pooled" before it is "extracted".4 Rust’s affine type system and algebraic data types (Enums with data) allow us to encode these biological constraints into the compiler itself. A Library struct can be defined such that it cannot be constructed unless it wraps a valid extracted_dna type. This "Make Invalid States Unrepresentable" philosophy significantly reduces the surface area for logic bugs in complex library preparation workflows.10
+Concurrency and Hardware I/O
+MISO integrates with hardware like the Thermo Scientific VisionMate scanner via TCP/IP.13 Java’s traditional thread-per-request model or blocking I/O can be resource-intensive and brittle under load. Rust’s asynchronous ecosystem, primarily powered by Tokio, allows for handling thousands of concurrent connections (e.g., multiple scanners, printers, and user sessions) with a minimal memory footprint. This is essential for scaling the system to support larger labs without linearly increasing hardware costs.12
+1.3 Scope of the Modernization
+The rewrite encompasses the full stack, transitioning from a Tiered Java Monolith to a Rust-based Modular Monolith using Hexagonal Architecture.
+Component
+	Legacy State (Java)
+	Target State (Rust)
+	Strategic Gain
+	Backend Core
+	Spring Framework (IOC, MVC)
+	Axum + Tokio
+	Removal of runtime reflection overhead; explicit control flow.
+	Persistence
+	Hibernate (JPA) + MySQL
+	SeaORM + MySQL 8.0
+	Elimination of "lazy loading" pitfalls; async-native database access.
+	Frontend
+	JSP, JQuery, Tiles
+	Leptos (WASM)
+	Reactive, client-side rendering; improved interactivity for complex plate maps.
+	Integration
+	Blocking Sockets (Custom Clients)
+	Tokio Async Streams
+	Resilient, non-blocking hardware communication with auto-reconnect.
+	Reporting
+	JasperReports / Apache POI
+	rust_xlsxwriter
+	High-performance, low-memory Excel generation for large datasets.
+	________________
+2. Deconstructing the Legacy: Anatomy of MISO
+To successfully rewrite MISO, the engineering team must first understand the artifacts they are replacing. The legacy system is not merely a collection of classes but a semantic map of the laboratory's operations.
+2.1 The Legacy Technology Stack
+The existing MISO repository relies on a classic enterprise Java stack, prevalent in the mid-2010s.5 The presence of pom.xml files indicates a Maven-based build system, managing dependencies for a multi-module project. Key identifiers include:
+* Spring Framework: Used for Dependency Injection (DI) and Web MVC. This implies heavily annotated code (@Autowired, @Controller) where relationships between components are established at runtime. The Rust rewrite must replace this with compile-time dependency injection using Traits and explicit struct initialization to improve observability and startup time.8
+* Hibernate: The Object-Relational Mapper (ORM). Hibernate abstracts SQL away, often using "Dirty Checking" to save changes automatically at the end of a transaction. This "magic" is a common source of performance issues in LIMS when handling large batches of samples (e.g., bulk accessioning). The Rust equivalent, SeaORM, will require explicit .save() calls, enforcing a more disciplined approach to database transactions.8
+* Java Server Pages (JSP) & SiteMesh/Tiles: The UI is rendered on the server. Snippets mention Fluxion and JQuery 8, indicating that interactivity (like form validation or dynamic table rows) is handled by hacking JavaScript on top of static HTML. This archaic pattern makes implementing dynamic features like "Drag-and-Drop Plate Layouts" difficult.
+2.2 The Domain Data Model
+The MISO data model is the heart of the system. Based on the documentation and commit logs, the schema supports a deep hierarchy of biological entities.4
+The Sample Lineage Hierarchy
+The core entity is the Sample, but it is polymorphic. MISO tracks "Plain Samples" (basic mode) and "Detailed Samples".3 The schema likely employs a Joined Inheritance strategy (e.g., a Sample table and a DetailedSample table). In Rust, this object-oriented inheritance is best modeled using composition or Enums.
+* Sample: The root physical entity. Contains attributes like organism, tissue_type, and collection_date.
+* Library: Derived from a Sample. Represents the DNA/RNA after preparation for sequencing. It includes metadata like kit_type, index_i7, and index_i5 (barcodes).
+* Pool: A logical and physical aggregation of Libraries. In NGS, multiple libraries are "pooled" together to run on a single flow cell lane. The LIMS must enforce validation here: ensuring no two libraries in a pool share the same barcode index.
+* Run: Represents the sequencer activity. It links a Pool to an Instrument (e.g., "Illumina HiSeq 2500").
+Spatial Management (The "Box" Model)
+MISO tracks the physical location of samples.3 This involves a coordinate system:
+* Container: A generic holder (Freezer, Shelf, Box).
+* Box: A specific container type (e.g., 9x9 cryobox).
+* Position: A coordinate (Row A, Column 1).
+Legacy Java implementations often model this with complex nested loops and mutable state to "move" a sample. The Rust rewrite should treat Position as a value object, using algebraic types to represent dimensions (e.g., enum Dimension { Grid(u8, u8) }) to prevent invalid coordinates (like "Row I" in an 8-row box) from ever being constructed.
+2.3 The Hardware Integration Layer
+A distinct module, visionmate-client, exists for communicating with Thermo Scientific VisionMate scanners.11
+   * Mechanism: The scanner acts as a TCP server (or client depending on mode), and the LIMS software connects to port 8000 (typical for these devices) to send commands.
+   * Protocol: The snippets reveal a command-response structure. Sending S triggers a scan. The response is an ASCII string containing the rack ID and the barcode at each position.14
+   * Legacy Issues: Java clients often use blocking socket calls (socket.getInputStream().read()). If the network hiccups or the scanner hangs, the LIMS thread blocks, potentially freezing the UI if not properly threaded.
+________________
+3. Architectural Blueprint: The Rust Modular Monolith
+To modernize MISO, we will adopt a Clean, Hexagonal Architecture (also known as Ports and Adapters). This architecture isolates the pure domain logic (the science) from the infrastructure (the database, the web, the hardware). This is crucial for testability and allows us to swap out infrastructure components (e.g., changing the scanner driver) without touching the core business rules.
+3.1 Workspace Structure and Crate Graph
+The Rust implementation will be structured as a Cargo Workspace, splitting the monolith into manageable crates.20 This enforces strict dependency boundaries.
+Crate Name
+	Role
+	Responsibilities
+	Dependencies
+	miso-domain
+	Core
+	Defines Entities (Sample, Run), Value Objects (Barcode), Domain Errors, and Repository Traits.
+	None (Pure Rust)
+	miso-application
+	Logic
+	Implements Use Cases (ReceiveSample, PoolLibraries), Service Structs, and DTOs.
+	miso-domain
+	miso-infrastructure
+	Adapter
+	Implements Repository Traits using SeaORM. Implements Hardware Clients (VisionMate) using Tokio.
+	miso-domain, sea-orm, tokio
+	miso-api
+	Port
+	Axum Web Server, HTTP Routes, Auth Middleware, DTO mapping.
+	miso-application, axum
+	miso-frontend
+	UI
+	Leptos WASM application, Components, Client-side routing.
+	leptos
+	miso-migration
+	Tooling
+	Database migration scripts and management.
+	sea-orm-migration
+	Strategic Rationale:
+   * miso-domain purity: By ensuring miso-domain has no dependencies on sqlx or axum, we guarantee that business rules are not coupled to the database schema or HTTP layer. This allows for extremely fast unit testing of complex logic (e.g., "Can this library be added to this pool?") without spinning up a database.
+   * Inversion of Control: miso-application defines interfaces (Traits) for what it needs (e.g., SampleRepository), and miso-infrastructure provides the implementation. This is the Rust equivalent of Spring's Dependency Injection but achieved via generic trait bounds rather than runtime reflection.22
+3.2 Error Handling Philosophy
+In Java, exceptions are often thrown loosely. In Rust, errors are values. We will use a tiered error handling strategy 24:
+   * Domain Layer: Use thiserror to define precise, semantic errors (e.g., SampleError::InvalidBarcodeFormat, PoolError::IndexCollision). These are part of the domain language.
+   * Application/API Layer: Use anyhow for top-level error handling where the specific type matters less than the context (e.g., "Failed to execute request").
+   * Hardware Layer: Custom error types wrapping std::io::Error to distinguish between "Scanner Disconnected" (recoverable) and "Protocol Error" (logic bug).
+3.3 Dependency Injection Strategy
+Rust does not have a comprehensive runtime DI container like Spring ApplicationContext. Instead, we will use Constructor Injection with Generics or Arc<dyn Trait>.22
+   * The Service Struct:
+Rust
+pub struct AccessionService<R: SampleRepository> {
+   repository: R,
+}
+
+   * Wiring (in main.rs):
+Rust
+let db = Database::connect(...).await?;
+let repo = SeaOrmSampleRepository::new(db);
+let service = Arc::new(AccessionService::new(repo));
+// Pass service to Axum state
+
+This manual wiring is verbose but explicit. It eliminates the "magic" startup failures common in Spring when a bean is missing, replacing them with compile-time errors.
+________________
+4. Technology Stack Selection and Justification
+The selection of libraries for the MISO rewrite is based on a rigorous analysis of the LIMS requirements against the current Rust ecosystem landscape.15
+4.1 Web Framework: Axum vs. Actix-web
+Decision: Axum
+      * Context: MISO requires high-concurrency handling for web requests and hardware integration.
+      * Analysis: While Actix-web is historically faster in micro-benchmarks, Axum provides a more ergonomic developer experience and deeper integration with the Tokio ecosystem. Axum’s extraction model (State, Json, Path) is intuitive for developers coming from Spring MVC.15
+      * Critical Factor: Axum is maintained by the Tokio team. Since our hardware integration (VisionMate) will rely heavily on Tokio, using a web framework built on the same core traits (Service, Tower) minimizes compatibility friction.
+4.2 Database ORM: SeaORM vs. Diesel vs. SQLx
+Decision: SeaORM
+      * Context: The existing MySQL database is complex and large. The team needs productivity similar to Hibernate but with better performance.
+      * Analysis:
+      * Diesel: Is synchronous (mostly) and rigid. It offers great compile-time safety but can be hard to work with for dynamic queries (e.g., "Find samples where name like X OR barcode like Y").
+      * SQLx: Provides raw SQL power. Great for performance, but manually mapping 50-column tables to structs is error-prone and tedious for a system of MISO's size.
+      * SeaORM: Built on top of SQLx, it is Async-first. It allows "Schema First" development—we can generate Rust entities from the existing MISO database.28 It supports dynamic query building, which is essential for the "Advanced Search" features of a LIMS.18
+      * Strategy: We will use sea-orm-cli to reverse-engineer the legacy schema, giving us a head start on the data layer implementation.
+4.3 Frontend: Leptos vs. Yew vs. HTMX
+Decision: Leptos
+      * Context: MISO's UI involves complex, interactive grids (Plate Maps) where users drag-and-drop samples. This requires immediate client-side feedback.
+      * Analysis:
+      * HTMX: Great for simple CRUD, but managing the state of a 96-well drag-and-drop interface via server round-trips would feel sluggish.
+      * Yew: Mature, but relies on a Virtual DOM (like React), which adds overhead.
+      * Leptos: Uses fine-grained reactivity (Signals), compiling to highly efficient WASM code that directly manipulates the DOM. It supports Server Functions (RPC), allowing the frontend to call backend Rust code (e.g., scan_barcode()) transparently, simplifying the API surface.26
+4.4 Hardware Async Runtime: Tokio
+Decision: Tokio
+      * Context: Reliable communication with networked lab equipment.
+      * Analysis: Tokio is the de-facto standard. Its net::TcpStream and io::AsyncReadExt traits are perfect for implementing the VisionMate protocol. Its select! macro allows for robust timeout handling—if the scanner hangs, the task can be cancelled cleanly without blocking the thread.12
+________________
+5. Implementation Guide: Domain and Persistence Layers
+This section details how to implement the core LIMS logic, translating Java concepts to Rust.
+5.1 Modeling the Sample Entity
+In Hibernate, entities are often cluttered with annotations. In miso-domain, entities will be pure structs.
+The Entity Definition
+
+
+Rust
+
+
+
+
+// crates/miso-domain/src/entities/sample.rs
+use serde::{Serialize, Deserialize};
+use chrono::NaiveDateTime;
+
+#
+pub struct Sample {
+   pub id: i32,
+   pub name: String,
+   pub barcode: String,
+   pub created_at: NaiveDateTime,
+   // Enums handle state more safely than strings
+   pub status: SampleStatus,
+}
+
+#
+pub enum SampleStatus {
+   Received,
+   Processing,
+   Completed,
+   Failed,
+}
+
+The Persistence Mapping (SeaORM)
+In miso-infrastructure, we map the domain entity to the database table.
+
+
+Rust
+
+
+
+
+// crates/miso-infrastructure/src/persistence/sample.rs
+use sea_orm::entity::prelude::*;
+
+#
+#[sea_orm(table_name = "sample")]
+pub struct Model {
+   #[sea_orm(primary_key)]
+   pub id: i32,
+   pub name: String,
+   pub barcode: String,
+   pub created_at: NaiveDateTime,
+   pub status: String, // DB stores as string
+}
+
+#
+pub enum Relation {
+   #[sea_orm(has_many = "super::library::Entity")]
+   Library,
+}
+
+impl ActiveModelBehavior for ActiveModel {}
+
+Insight: Note the separation. The Domain SampleStatus is an Enum. The Persistence Model stores it as a String. The Repository implementation is responsible for converting between them, ensuring that invalid strings in the legacy DB don't crash the domain logic (by handling conversion errors gracefully).
+5.2 The Repository Pattern & The "Lazy Loading" Problem
+A major risk in rewriting Hibernate applications is the loss of implicit lazy loading. In Java, sample.getLibraries() works automatically. In Rust, it does not.
+The Explicit Loading Strategy
+We must design repositories to be explicit about data fetching depth.
+
+
+Rust
+
+
+
+
+// crates/miso-domain/src/repositories/sample_repo.rs
+#[async_trait]
+pub trait SampleRepository: Send + Sync {
+   // Basic fetch
+   async fn find_by_id(&self, id: i32) -> Result<Option<Sample>, RepoError>;
+   
+   // Explicit fetch with children
+   async fn find_with_libraries(&self, id: i32) -> Result<Option<(Sample, Vec<Library>)>, RepoError>;
+}
+
+The Implementation
+Using SeaORM's loader capabilities:
+
+
+Rust
+
+
+
+
+// crates/miso-infrastructure/src/repositories/sea_orm_repo.rs
+impl SampleRepository for SeaOrmSampleRepo {
+   async fn find_with_libraries(&self, id: i32) -> Result<Option<(Sample, Vec<Library>)>, RepoError> {
+       let result = SampleEntity::find_by_id(id)
+          .find_with_related(LibraryEntity)
+          .all(&self.db_conn)
+          .await?;
+           
+       // Transformation logic to Domain types...
+   }
+}
+
+This forces developers to think about performance. If they need libraries, they must call find_with_libraries, preventing the N+1 query problem that plagued the legacy system.18
+________________
+6. Implementation Guide: Hardware Integration (VisionMate)
+The integration with the VisionMate scanner is a critical differentiation point. The legacy client 11 uses blocking I/O. We will build a resilient, async client.
+6.1 The VisionMate Protocol
+Based on the documentation 14, the communication flow is:
+      1. Connection: TCP/IP to port 8000.
+      2. Command: Client sends S (Start Scan) + Carriage Return.
+      3. Response: Server responds with OKS followed by comma-separated rack data (e.g., OKS,A01:12345,A02:67890...).
+6.2 Async Client Architecture
+We will use a VisionMateClient struct that manages the TcpStream.
+Robust Connection Handling
+In a lab, network cables get bumped. The client must handle disconnections. We will use a "connection pool" approach or simple reconnection logic on failure.
+
+
+Rust
+
+
+
+
+// crates/miso-infrastructure/src/scanner/visionmate.rs
+use tokio::net::TcpStream;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::time::{timeout, Duration};
+
+pub struct VisionMateClient {
+   host: String,
+   port: u16,
+}
+
+impl VisionMateClient {
+   pub async fn scan(&self) -> Result<ScanResult, ScannerError> {
+       // Connect with timeout
+       let addr = format!("{}:{}", self.host, self.port);
+       let mut stream = timeout(Duration::from_secs(2), TcpStream::connect(&addr))
+          .await
+          .map_err(|_| ScannerError::ConnectTimeout)?
+          .map_err(ScannerError::IoError)?;
+
+       // Send Command
+       stream.write_all(b"S\r").await?;
+
+       // Read Response
+       let mut buffer = [0; 4096];
+       let n = timeout(Duration::from_secs(5), stream.read(&mut buffer))
+          .await
+          .map_err(|_| ScannerError::ReadTimeout)?
+          .map_err(ScannerError::IoError)?;
+
+       let response = String::from_utf8_lossy(&buffer[..n]);
+       self.parse_response(&response)
+   }
+
+   fn parse_response(&self, raw: &str) -> Result<ScanResult, ScannerError> {
+       if!raw.starts_with("OKS") {
+           return Err(ScannerError::DeviceError(raw.to_string()));
+       }
+       // Parsing logic here...
+       Ok(ScanResult::default())
+   }
+}
+
+Strategic Insight: By wrapping the connect and read operations in tokio::time::timeout, we guarantee the server never hangs indefinitely waiting for a scanner that has been turned off. This responsiveness is a massive UX improvement over the Java client.12
+________________
+7. Implementation Guide: Frontend Modernization (Leptos)
+The MISO frontend is complex, requiring data-dense displays. We will use Leptos to build a Single Page Application (SPA) experience.
+7.1 Server Functions for Seamless Integration
+Leptos offers "Server Functions," which allow us to write backend logic directly in the component file. The compiler separates the code: the body runs on the server (Axum), and the frontend (WASM) generates an API call automatically.26
+Example: Triggering a Scan from the UI
+
+
+Rust
+
+
+
+
+// crates/miso-frontend/src/components/scanner.rs
+use leptos::*;
+
+#
+pub async fn trigger_scan(ip: String) -> Result<Vec<String>, ServerFnError> {
+   // This runs on the server!
+   // We can access the VisionMateClient directly here
+   let scanner = use_context::<Arc<VisionMateClient>>().ok_or("No scanner service")?;
+   let result = scanner.scan().await?;
+   Ok(result.barcodes)
+}
+
+#[component]
+pub fn ScannerControl(cx: Scope) -> impl IntoView {
+   let scan_action = create_action(cx, |ip: &String| trigger_scan(ip.clone()));
+   
+   let result_view = move |
+
+| match scan_action.value().get() {
+       Some(Ok(barcodes)) => view! { cx, <ul>{
+           barcodes.into_iter().map(|b| view! { cx, <li>{b}</li> }).collect_view(cx)
+       }</ul> },
+       Some(Err(e)) => view! { cx, <div class="error">"Scan Failed: " {format!("{:?}", e)}</div> },
+       None => view! { cx, <div>"Ready to scan"</div> },
+   };
+
+   view! { cx,
+       <div class="scanner-panel">
+           <button on:click=move |_| scan_action.dispatch("192.168.1.50".to_string())>
+               "SCAN RACK"
+           </button>
+           {result_view}
+       </div>
+   }
+}
+
+This pattern dramatically simplifies development. There is no need to define a REST DTO, write a serializer, write a frontend fetcher, and write a deserializer. It is all handled by the macro.
+7.2 State Management: Signals
+Leptos uses Signals for reactivity. For the Plate Map (96 wells), we will create a Signal<Vec<Well>>. Updating a single well (e.g., clicking to select it) will update only that specific DOM element, ensuring high performance even with multiple plates on screen.30
+________________
+8. Authentication and Authorization
+Security is paramount for LIMS handling patient-derived samples.
+8.1 Authentication Strategy
+We will use axum-login with a custom backend.
+      * Legacy Integration: The OICR environment likely uses LDAP (Active Directory).
+      * Rust Implementation: We will implement the AuthnBackend trait for a struct that wraps the ldap3 crate.31
+      * Flow:
+      1. User posts username/password.
+      2. Rust backend binds to LDAP server.
+      3. If successful, a session is created (using tower-sessions) and stored in Redis or signed cookies.
+8.2 Authorization (RBAC)
+MISO has granular permissions (e.g., "Lab Managers" can delete samples; "Technicians" can only add).
+      * Tool: casbin-rs.33
+      * Implementation: We will define a model (model.conf) and policy (policy.csv) or load policies from the database.
+      * Middleware: An Axum middleware will intercept requests, extract the user's role from the session, and query the Casbin Enforcer: enforcer.enforce((user_role, resource, action)).
+________________
+9. Migration and Operational Plan: The Strangler Fig
+Replacing the entire LIMS at once is high-risk. We will use the Strangler Fig Pattern to migrate incrementally.35
+9.1 Phase 1: The Facade
+We will deploy an NGINX Reverse Proxy in front of the legacy Tomcat server.
+      * Configuration: All traffic routes to Tomcat by default.
+      * Objective: Establish a control point for traffic routing without changing user workflows.
+9.2 Phase 2: The Parallel Deployment
+We will deploy the Rust application (containerized via Docker) alongside the legacy app.
+      * Database: The Rust app will connect to the existing MySQL database in Read-Only mode initially.
+      * Feature: Implement a read-only "Run Status Dashboard" in Rust.
+      * Routing: Configure NGINX to route /dashboard/v2 to the Rust container.
+      * Validation: This tests the SeaORM mappings and Rust stability without risking data corruption.
+9.3 Phase 3: Vertical Slice (The "Strangling")
+We will select a specific, isolated module to migrate fully: Hardware Scanning.
+      1. Migrate the "Scan Rack" UI to Leptos.
+      2. Route /scan requests to the Rust app.
+      3. The Rust app connects to VisionMate, performs the scan, and writes the result to the rack_scan table in MySQL.
+      4. The Legacy Java app reads from the rack_scan table (integration via database).
+      5. Retire the Java visionmate-client code.
+9.4 Phase 4: Core Domain & Sunset
+Gradually migrate the heavy write workflows (Sample Accessioning, Library Prep). Once a domain entity (e.g., Sample) is fully managed by Rust, enforce database constraints that might break the Java app, effectively locking it out. Finally, decommission the Tomcat server.
+________________
+10. Conclusion and Forward Directives
+This report establishes the necessary architectural scaffolding for rewriting MISO LIMS in Rust. By moving to a Modular Monolith architecture powered by Axum, SeaORM, and Tokio, the GSI group can eliminate the performance bottlenecks of the JVM and secure their infrastructure with Rust's memory safety guarantees.
+Directives for the Engineering Agent:
+      1. Prioritize the Domain: Begin by defining the miso-domain crate entities and traits before writing a single line of HTTP or Database code.
+      2. Verify Hardware Protocols: Create a standalone CLI tool using tokio to verify communication with the VisionMate scanner before integrating it into the web server.
+      3. Strict Schema Adherence: Use sea-orm-cli to generate the initial entity bindings from the production database schema to ensure 100% compatibility during the migration phase.
+The path forward is clear. The technology is mature. The strategy is defined. Proceed with the implementation of miso-domain.
+Works cited
+      1. MISO-lims - Ontario Institute for Cancer Research, accessed December 14, 2025, https://oicr.on.ca/wp-content/uploads/2024/06/OJGP-MISO.pdf
+      2. cidgoh/MISO_LIMS_Cloud - GitHub, accessed December 14, 2025, https://github.com/cidgoh/MISO_LIMS_Cloud
+      3. Getting Started with MISO - MISO LIMS, accessed December 14, 2025, https://miso-lims.github.io/walkthroughs/
+      4. MISO LIMS Documentation, accessed December 14, 2025, https://miso-lims.readthedocs.io/
+      5. MetaLIMS, a simple open-source laboratory information management system for small metagenomic labs - PMC - NIH, accessed December 14, 2025, https://pmc.ncbi.nlm.nih.gov/articles/PMC5449644/
+      6. MISO LIMS : managing information for sequencing... | Slides - F1000Research, accessed December 14, 2025, https://f1000research.com/slides/8-1385
+      7. miso-lims/miso-lims · GitHub - Workflow runs, accessed December 14, 2025, https://github.com/miso-lims/miso-lims/actions
+      8. MISO: an open source LIMS for sequencing centres - F1000, accessed December 14, 2025, https://f1000research-files.f1000.com/posters/docs/f1000research-87809.pdf?_ga=undefined
+      9. Have You Ever Migrated To or From Rust? Lessons from Java Community Voices, accessed December 14, 2025, https://dev.to/brunoborges/have-you-ever-migrated-to-or-from-rust-lessons-from-java-community-voices-589k
+      10. Migrating from Java to Rust - Corrode.dev, accessed December 14, 2025, https://corrode.dev/learn/migration-guides/java-to-rust/
+      11. visionmate-client/release.sh at master - GitHub, accessed December 14, 2025, https://github.com/miso-lims/visionmate-client/blob/master/release.sh
+      12. How to handle reconnect & shutdown correctly in Tokio? - Rust Users Forum, accessed December 14, 2025, https://users.rust-lang.org/t/how-to-handle-reconnect-shutdown-correctly-in-tokio/105759
+      13. MISO LIMS - GitHub, accessed December 14, 2025, https://github.com/miso-lims
+      14. Thermo Scientific™ VisionMate™ High Speed 2D Barcode Reader with Magnetic 1D Barcode Reader Attachment, accessed December 14, 2025, https://documents.thermofisher.com/TFS-Assets/LCD/manuals/VisionMate-HighSpeed-User-Manual-EN.pdf
+      15. Building Rust Web Apps - Shuttle.dev, accessed December 14, 2025, https://www.shuttle.dev/blog/2025/11/12/build-rust-web-apps
+      16. MISO: An open-source LIMS for NGS sequencing centres - GitHub, accessed December 14, 2025, https://github.com/miso-lims/miso-lims
+      17. spring-rs is a application framework written in rust inspired by java's spring-boot - GitHub, accessed December 14, 2025, https://github.com/spring-rs/spring-rs
+      18. A Guide to Rust ORMs in 2025 - Shuttle.dev, accessed December 14, 2025, https://www.shuttle.dev/blog/2024/01/16/best-orm-rust
+      19. Thermo Scientific™ VisionMate™ High Speed 2D Barcode Reader, accessed December 14, 2025, https://assets.fishersci.com/TFS-Assets/LSG/manuals/VisionMate-HighSpeedManual-042814.pdf
+      20. The best way to structure Rust web services - LogRocket Blog, accessed December 14, 2025, https://blog.logrocket.com/best-way-structure-rust-web-services/
+      21. Cargo.toml - flosse/clean-architecture-with-rust - GitHub, accessed December 14, 2025, https://github.com/flosse/clean-architecture-with-rust/blob/master/Cargo.toml
+      22. How Traits Enable Dependency Injection in Rust - DEV Community, accessed December 14, 2025, https://dev.to/sgchris/how-traits-enable-dependency-injection-in-rust-5a50
+      23. Architecture of a rust application - Reddit, accessed December 14, 2025, https://www.reddit.com/r/rust/comments/1lygfc4/architecture_of_a_rust_application/
+      24. Top 5 Rust Crates to Make Development Easier - DEV Community, accessed December 14, 2025, https://dev.to/trish_07/top-5-rust-crates-to-make-development-easier-gi8
+      25. IoC/Dependency Injection in Rust : r/rust - Reddit, accessed December 14, 2025, https://www.reddit.com/r/rust/comments/101uau1/iocdependency_injection_in_rust/
+      26. Rust Web Frameworks: A Thorough Comparison Of Recommendations From Frontend To Backend - Relipa Global, accessed December 14, 2025, https://relipa.global/rust-web-frameworks/
+      27. Compare with Diesel | SeaORM An async & dynamic ORM for Rust - SeaQL, accessed December 14, 2025, https://www.sea-ql.org/SeaORM/docs/0.5.x/internal-design/diesel/
+      28. SeaORM An async & dynamic ORM for Rust - SeaQL, accessed December 14, 2025, https://www.sea-ql.org/SeaORM/
+      29. Using Rust and Leptos to build beautiful, declarative UIs - LogRocket Blog, accessed December 14, 2025, https://blog.logrocket.com/using-rust-leptos-build-beautiful-declarative-uis/
+      30. Building High-Performance Web Frontends with Rust, Yew, and Leptos | Leapcell, accessed December 14, 2025, https://leapcell.io/blog/building-high-performance-web-frontends-with-rust-yew-and-leptos
+      31. ldap3 - Rust - Docs.rs, accessed December 14, 2025, https://docs.rs/ldap3
+      32. axum_login - Rust - Docs.rs, accessed December 14, 2025, https://docs.rs/axum-login
+      33. Overview - Casbin, accessed December 14, 2025, https://casbin.org/docs/overview/
+      34. casbin/casbin-rs: An authorization library that supports access control models like ACL, RBAC, ABAC in Rust. - GitHub, accessed December 14, 2025, https://github.com/casbin/casbin-rs
+      35. Strangler fig pattern - AWS Prescriptive Guidance, accessed December 14, 2025, https://docs.aws.amazon.com/prescriptive-guidance/latest/modernization-decomposing-monoliths/strangler-fig.html
+      36. Strangler Fig Pattern - Azure Architecture Center | Microsoft Learn, accessed December 14, 2025, https://learn.microsoft.com/en-us/azure/architecture/patterns/strangler-fig

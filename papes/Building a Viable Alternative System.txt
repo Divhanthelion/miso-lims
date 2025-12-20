@@ -1,0 +1,295 @@
+﻿Architectural Blueprint for the Parallel Construction of a High-Performance Genomic LIMS
+1. Executive Summary and Strategic Imperative
+1.1. The Operational Context of High-Throughput Genomics
+The contemporary genomic sequencing landscape is defined by an exponential increase in data velocity and volume, driven by high-throughput platforms such as the Illumina NovaSeq X and Oxford Nanopore PromethION.1 These instruments generate terabytes of data per run, necessitating a Laboratory Information Management System (LIMS) that is not merely a passive repository of metadata but an active, real-time participant in the sequencing workflow. The current incumbent system, MISO (Managing Information for Sequencing Operations), developed by the Earlham Institute and the Ontario Institute for Cancer Research (OICR), has successfully underpinned these operations using a traditional Java enterprise stack.2 However, as the operational tempo accelerates, the latency introduced by the Java Virtual Machine (JVM)—specifically regarding garbage collection (GC) pauses and memory consumption—poses a growing risk to the real-time monitoring capabilities required for modern sequencing centers.4
+This report outlines the architectural specification for a "viable alternative system," herein referred to as Helix-LIMS. This system is designed not to immediately displace MISO but to be constructed in parallel, leveraging the Rust programming language to achieve functional parity while offering superior performance, deterministic memory safety, and zero-cost abstractions.4 The ultimate objective is to provide a redundant, high-performance infrastructure capable of handling the same complex "Detailed Sample Mode" hierarchies and instrument integrations as the original, thereby securing the facility’s operational continuity through diverse redundancy.
+1.2. The Case for a Rust-Based Alternative
+The decision to architect the alternative system in Rust is driven by three critical factors derived from the analysis of the current limitations and future requirements:
+1. Deterministic Resource Management: Unlike the legacy Java system, which relies on a garbage collector that can introduce unpredictable latency spikes ("stop-the-world" events), Rust utilizes a strict ownership and borrowing model that manages memory at compile time.4 This is critical for the "Run Scanner" subsystem, which must monitor file system events from sequencers with millisecond precision to ensure data integrity during transfer and analysis.7
+2. Type-Driven Correctness: Genomic workflows are state-heavy (e.g., a sample cannot be pooled until it passes Quality Control). Rust’s affine type system allows for the encoding of these states into the type signature of the application logic (Typestate Pattern), rendering invalid state transitions impossible at compile time.6 This contrasts with the Spring/Hibernate model, which often relies on runtime validation and reflection, increasing the surface area for "NullPointerException" and state-mismatch errors.10
+3. Seamless Foreign Function Interface (FFI): The integration with sequencing instruments often requires interfacing with vendor-provided C++ Software Development Kits (SDKs), such as the Illumina InterOp library.11 Rust offers a native FFI that allows for zero-cost binding to these C++ libraries without the overhead and complexity of the Java Native Interface (JNI), enabling direct, high-speed parsing of binary run metrics.13
+1.3. Scope of the Parallel Construction
+The mandate to build a system "capable of all of the same things" [User Query] without immediate replacement dictates a specific architectural pattern: The Strangler Fig. This report details a roadmap where Helix-LIMS is deployed alongside MISO, sharing the same underlying data persistence layer initially, and gradually assuming read-only responsibilities (via the Pinery reporting API) before eventually handling write traffic. This parallel construction mitigates the existential risk of a "big bang" migration, allowing for rigorous "Shadow Testing" where production traffic is mirrored to the new system to validate its logic against the legacy baseline before any user relies on it.15
+2. Comprehensive Analysis of the Legacy MISO Ecosystem
+To build a functionally equivalent alternative, we must first conduct a forensic deconstruction of the existing MISO LIMS to understand the "Detailed Sample Mode" complexity and the hidden dependencies within its satellite services.
+2.1. The Functional Core: Detailed Sample Mode
+MISO distinguishes itself from generic LIMS by its specific support for eukaryotic sequencing operations and a deep hierarchical model known as "Detailed Sample Mode".2 A generic "Sample" entity is insufficient. The alternative system must replicate the following specific entity relationships:
+* Identity: The conceptual source of the biological material (e.g., a specific patient or organism).
+* Tissue: The physical extraction from the Identity.
+* Stock (gDNA/RNA): The purified nucleic acid derived from the Tissue.
+* Aliquot: A portion of the Stock used for actual experimentation.
+* Library: The Aliquot prepared with specific adapters for sequencing.
+* Pool: A logical and physical mixture of Libraries.
+The legacy system manages this hierarchy using Hibernate, likely employing a "Table-Per-Class" or "Joined" inheritance strategy within the MySQL database.20 This structure allows for polymorphic queries (e.g., "Find all items in Box A," where items can be Tissues or Libraries). The Rust alternative must map this relational complexity without the runtime overhead of Hibernate's proxy objects, utilizing explicit trait-based composition or enum dispatch to handle the polymorphism.21
+2.2. Critical Subsystems and Satellites
+Beyond the core web application, the MISO ecosystem relies on satellite services that are critical to the "all of the same things" requirement.
+2.2.1. The Run Scanner
+The Run Scanner is a standalone daemon that monitors the storage attached to sequencing instruments.8 Its responsibilities include:
+* Detection: Identifying new sequencing runs (e.g., detecting RunInfo.xml).
+* State Tracking: Monitoring the progression of a run (e.g., RTAComplete.txt).
+* Metric Extraction: Parsing binary files generated by the Real-Time Analysis (RTA) software to extract quality metrics (Q30, Cluster Density).22
+* Analysis Triggering: Notifying downstream pipelines via the Pinery API when a run is complete.
+In the legacy Java implementation, this service is constrained by the efficiency of the Java NIO WatchService, which can be resource-intensive on network-attached storage (NAS) and suffers from potential event loss during high-load garbage collection cycles.4
+2.2.2. The Pinery Reporting Service
+Pinery acts as an abstraction layer between the complex, normalized LIMS database schema and the denormalized JSON requirements of bioinformatics pipelines.23 It exposes a REST API that aggregates data across the sample hierarchy.
+* Significance: Pinery is the primary interface for automated analysis. If the alternative system cannot serve Pinery-compatible responses, the facility's bioinformatics pipelines will fail. Therefore, Pinery is the primary candidate for the initial "Read-Only" phase of the parallel construction.
+2.3. The Data Persistence Layer
+MISO utilizes MySQL (or MariaDB) as its backing store, with schema evolution managed by Flyway.20 The database schema is highly normalized to support the sample hierarchy.
+* Constraint: To operate as a "viable alternative system" running in parallel, Helix-LIMS must be able to read and write to this exact same schema. It cannot impose a new schema design without breaking the legacy MISO. This requires an ORM strategy in Rust that supports "Database-First" or "Schema-First" generation, rather than the "Code-First" approach common in some modern frameworks.21
+2.4. Limitations of the Current Architecture
+The current Spring/Hibernate stack, while mature, presents specific limitations that the Rust alternative aims to resolve:
+1. Memory Footprint: Java applications generally require a significant heap allocation (often gigabytes) to manage the object graph of a complex LIMS. This increases the cost of cloud deployment (AWS/Azure).4
+2. Startup Latency: Spring Boot applications can take tens of seconds to start up due to dependency injection scanning and classpath analysis. This hinders "Serverless" or "Scale-to-Zero" deployment strategies.
+3. Concurrency Model: The traditional thread-per-request model of Servlet containers (like Tomcat) scales linearly with memory. Rust's asynchronous model (Tokio) allows for handling thousands of concurrent connections with a fixed, small thread pool.25
+3. Helix-LIMS: Architectural Specification
+The proposed architecture for Helix-LIMS leverages the Rust ecosystem to provide a high-performance, memory-safe, and functionally equivalent alternative.
+3.1. Core Technology Stack Selection
+
+
+Architectural Component
+	Legacy Implementation (MISO)
+	Proposed Alternative (Helix-LIMS)
+	Justification for Selection
+	Programming Language
+	Java (JDK 8+)
+	Rust (Stable)
+	Provides memory safety without GC pauses; ideal for high-throughput I/O and FFI.4
+	Web Framework
+	Spring MVC
+	Axum
+	Built on Tokio; ergonomic, modular, and designed for high-concurrency async workloads.25
+	ORM / Data Access
+	Hibernate (JPA)
+	SeaORM
+	Async-native; supports "Database-First" schema reflection; flexible dynamic query building.21
+	Asynchronous Runtime
+	N/A (Thread-per-request)
+	Tokio
+	The industry standard for Rust async execution; enables highly efficient file watching and network I/O.25
+	API Interface
+	REST (Spring Controllers)
+	REST (Axum Handlers)
+	Mirrors the existing API contract; auto-generates OpenAPI specs via utoipa for validation.27
+	File System Watcher
+	Java WatchService
+	notify
+	Leverages OS-native event APIs (inotify, kqueue) for low-overhead monitoring.6
+	Binary Parsing
+	Custom Java / XML Parsers
+	nom / binrw
+	Combinator-based parsing for safe, zero-copy extraction of data from binary sequencer files.29
+	C++ Integration
+	JNI (implied)
+	bindgen / cxx
+	Generates safe Rust bindings for the Illumina InterOp C++ SDK.14
+	3.2. Application Architecture: The Modular Monolith
+While Microservices are a popular pattern, the tightly coupled nature of LIMS entities (where a Library cannot exist without a Project) suggests that a Modular Monolith is the appropriate architecture for Helix-LIMS. This allows for code sharing between the API and the Run Scanner while maintaining logical separation.
+Workspace Structure:
+The project will be organized as a Cargo Workspace 31 to manage dependencies and compilation units effectively:
+* helix-core: The domain entities, SeaORM models, and shared business logic (e.g., barcode validation).
+* helix-api: The Axum web server exposing the REST endpoints and the Pinery reporting service.
+* helix-scanner: The standalone daemon responsible for monitoring sequencing instruments.
+* helix-interop: A wrapper crate containing the FFI bindings to the Illumina SDK.
+* helix-migration: A utility crate for managing database schema consistency (interfacing with Flyway).
+3.3. The Data Access Layer: SeaORM vs. Diesel
+The choice of Object-Relational Mapper (ORM) is pivotal. The Rust ecosystem offers two primary contenders: Diesel and SeaORM.
+* Diesel: Focuses on compile-time safety and static query checking. However, it is synchronous (blocking) by default and has a rigid type system that can be difficult to map to legacy schemas with complex inheritance.21
+* SeaORM: Is built on top of sqlx (async) and is designed to be dynamic.
+   * Decision: SeaORM is selected for Helix-LIMS.
+   * Reasoning:
+      1. Async Support: Essential for the high-concurrency requirements of the Pinery API.
+      2. Schema Reflection: SeaORM provides a CLI tool (sea-orm-cli) that can connect to the existing MISO MySQL database and generate the Rust entity definitions automatically. This is crucial for ensuring the alternative system adheres strictly to the legacy schema without manual error-prone mapping.21
+      3. Dynamic Queries: LIMS users frequently require "Advanced Search" capabilities (e.g., "Find all samples created between date X and Y with property Z"). SeaORM’s dynamic query builder is better suited for this than Diesel’s static types.21
+3.4. Modeling the Detailed Sample Hierarchy in Rust
+The "Detailed Sample Mode" requires handling polymorphism. In Java, Tissue extends Sample. In Rust, we utilize composition and Enums.
+Entity Design Pattern:
+We define a base Sample struct that maps to the sample table, containing common fields (ID, Name, Barcode). Specific attributes for subclasses are stored in related tables (tissue, library) or a JSON column if the schema allows.
+
+
+Rust
+
+
+
+
+// Simplified SeaORM Entity Definition
+#
+#[sea_orm(table_name = "sample")]
+pub struct Model {
+   #[sea_orm(primary_key)]
+   pub id: i32,
+   pub name: String,
+   pub barcode: String,
+   pub sample_class: String, // Discriminator column
+   pub project_id: i32,
+   //...
+}
+
+#
+pub enum Relation {
+   #[sea_orm(has_one = "super::tissue::Entity")]
+   Tissue,
+   #[sea_orm(has_one = "super::library::Entity")]
+   Library,
+}
+
+This structure allows Helix-LIMS to perform eager loading of related data (e.g., fetching a Sample and its associated Tissue data) efficiently using SeaORM’s .find_with_related() methods, mirroring the behavior of Hibernate’s FetchType.EAGER but with explicit control over the SQL query generation to prevent N+1 performance issues.21
+4. The Run Scanner Subsystem: High-Performance Integration
+The Run Scanner is the "eyes" of the LIMS. Its reimplementation in Rust offers the most significant performance gains over the legacy system.
+4.1. Event-Driven File Monitoring
+The legacy system likely polls the file system, which is inefficient. Helix-LIMS will utilize the notify crate.
+* Mechanism: notify abstracts over OS-specific event mechanisms (inotify on Linux, FSEvents on macOS, ReadDirectoryChangesW on Windows). This allows the Run Scanner to sleep until the kernel notifies it of a file change, drastically reducing CPU usage compared to Java’s polling loop.6
+* Debouncing Strategy: Sequencing instruments (like the NovaSeq) write files in bursts. A raw event listener would trigger too frequently. The Rust implementation will use tokio::time to implement a debounce buffer, aggregating events (e.g., "wait for 5 seconds of silence after a write") before triggering the parsing logic. This ensures that partially written files (like RunInfo.xml) are not read prematurely.
+4.2. Interfacing with Illumina InterOp via FFI
+A critical requirement is parsing the binary metrics files generated by Illumina sequencers (.bin files in the InterOp directory). These contain vital QC data: Q-scores, Error Rates, and Occupancy.11
+* The Challenge: These are binary formats. Reverse-engineering them is fragile. Illumina provides a C++ SDK (InterOp).12
+* The Solution: Rust’s Foreign Function Interface (FFI).
+   * Tooling: We will use bindgen to automatically generate unsafe Rust bindings to the Illumina C++ headers.34
+   * Architecture:
+      1. helix-interop-sys: A crate that links to the static libInterOp.a library.
+      2. helix-interop: A safe Rust wrapper. This crate implements the RAII (Resource Acquisition Is Initialization) pattern. When a Rust struct representing a RunMetrics object is dropped, the Drop trait implementation calls the C++ destructor, ensuring no memory leaks—a common issue in JNI implementations.14
+   * Benefit: This allows Helix-LIMS to extract metrics at the speed of C++, directly into the application memory space, without the overhead of spawning external processes or the fragility of text parsing.11
+4.3. Bioinformatics QC with Rust-Bio
+Beyond metadata, the LIMS must verify the integrity of the sequencing request. A common failure mode is "Barcode Collision," where two samples in the same pool share the same index sequence.
+* Legacy Approach: MISO likely queries the DB and performs string comparisons in Java.
+* Rust Approach: Helix-LIMS will utilize the rust-bio or noodles crates.29
+   * Hamming Distance: Using rust-bio, the system can efficiently calculate the Hamming distance between all proposed barcodes in a pool. Rust’s SIMD (Single Instruction, Multiple Data) optimized implementations can perform these checks on thousands of barcodes in microseconds, providing immediate feedback to the technician during the "Pool Creation" workflow.29
+5. Migration Engineering: The Strangler Fig Pattern
+Constructing a parallel system is only half the challenge; the other half is integrating it without disrupting operations. The Strangler Fig Pattern is the industry-standard approach for this type of migration.15 It involves gradually replacing specific functionalities of the monolithic application with new services, using a proxy to route traffic.
+5.1. Phase 1: The Proxy and Read-Only Shim
+The first step is to insert a routing layer. Envoy Proxy is selected for its high performance and advanced traffic management capabilities.36
+Architecture:
+* Ingress: All user traffic (HTTP/HTTPS) is directed to Envoy.
+* Default Route: All traffic is forwarded to the Legacy MISO (Tomcat) container.
+* Pinery Route: Traffic matching /pinery/* (the reporting API) is routed to the new Helix-LIMS (Axum) container.
+   * Rationale: Pinery is read-only. Replacing it carries the lowest risk of data corruption. If the Rust implementation has a bug, it only affects reporting, not the physical tracking of samples.
+5.2. Phase 2: Traffic Mirroring (Shadow Testing)
+Once the Helix-LIMS is deployed, we must verify its "write" logic (e.g., creating samples) without letting it alter the production database.
+* Mechanism: Envoy’s Request Mirroring feature is enabled for write endpoints (e.g., POST /samples).
+YAML
+route:
+ cluster: legacy_miso
+ request_mirror_policies:
+   - cluster: helix_lims
+     runtime_fraction: { default_value: { numerator: 100, denominator: HUNDRED } }
+
+* Shadow Mode Logic: The Helix-LIMS application must be aware it is in "Shadow Mode." When it receives a mirrored request:
+   1. It processes the validation logic (e.g., checking barcode uniqueness).
+   2. It constructs the database transaction.
+   3. Crucially: It rolls back the transaction at the end, or writes the result to a separate "Shadow" database schema.
+   4. It logs the result and the HTTP response it would have sent.
+   * Diff Analysis: A separate service (inspired by Twitter’s Diffy) compares the response logs from the Legacy MISO (actual) and Helix-LIMS (shadow). Any discrepancy in status code or JSON body indicates a logic gap that must be fixed.38
+5.3. Phase 3: Data Synchronization via CDC
+For the parallel system to be truly "capable of all the same things," it must possess the current state of the database. Since MISO is still the primary writer, Helix-LIMS needs a way to stay in sync.
+   * Dual Write vs. CDC: Modifying the legacy Java code to write to two places (Dual Write) is an anti-pattern prone to inconsistency.39 Instead, we use Change Data Capture (CDC).
+   * Implementation:
+   1. Debezium: A Debezium connector monitors the MySQL binary log (binlog) of the legacy database.40
+   2. Kafka: Debezium publishes every row-level change (INSERT, UPDATE, DELETE) to a Kafka topic (e.g., miso.samples).42
+   3. Helix Consumer: A background service in Helix-LIMS consumes these topics.
+   * If Helix is using a separate read-replica DB, it applies these changes to keep it in sync.
+   * If Helix is using the same DB (Shared Database pattern), this stream can be used to trigger cache invalidation or side-effects (e.g., "Sample X changed, re-calculate Pool metrics").43
+5.4. Phase 4: Incremental Cutover
+Once Shadow Testing confirms 100% parity for a specific module (e.g., "Library Prep"), the Envoy configuration is updated to route that specific path to Helix-LIMS as the primary handler. The Legacy MISO code for that module is then effectively deprecated (strangled). This process repeats until the legacy system is entirely managed by the new Rust architecture.
+6. Frontend Modernization: Decoupling the UI
+The legacy system uses JSP (JavaServer Pages), which tightly couples the User Interface (UI) to the Java backend. This is an obstacle to migration. To support the Strangler Fig pattern, the UI must be decoupled.44
+6.1. Transition to React
+The report recommends migrating the frontend to React (with TypeScript).
+   * Strategy: The new React application will be served as a Single Page Application (SPA).
+   * API Gateway: The React app will make API calls to the Envoy Gateway. Envoy will route these calls to either MISO or Helix-LIMS depending on the migration phase.
+   * Authentication: The legacy system likely uses session-based auth (JSESSIONID). The new system should implement JWT (JSON Web Tokens) or OAuth2.10 During the transition, an adapter service can exchange a legacy JSESSIONID for a temporary JWT to allow the React app to communicate with the Rust backend securely.
+7. Operationalization and Infrastructure
+7.1. Docker and Containerization
+The legacy MISO is deployed via Docker Compose.45 Helix-LIMS will follow suit but with significantly optimized container images.
+   * Multistage Builds: Rust binaries are statically linked. The Dockerfile will use a planner stage for dependency caching and a builder stage for compilation. The final image will be based on gcr.io/distroless/cc, resulting in an image size of <50MB, compared to the 500MB+ often required for a Java/Tomcat base image.4
+7.2. Observability and Metrics
+To prove the "High Performance" claim, rigorous metrics are required.
+   * Tooling: The metrics crate in Rust provides a facade for instrumentation.46
+   * Key Indicators:
+   * Run Scanner Latency: Time from file creation on disk to DB update. Rust is expected to show <100ms latency, whereas Java GC pauses could push this to seconds.
+   * Memory Resident Set Size (RSS): Rust services should demonstrate a stable, flat memory profile, unlike the "sawtooth" pattern of Java heap usage.4
+   * Pinery Request Throughput: Number of reporting requests handled per second.
+7.3. Continuous Integration / Continuous Deployment (CI/CD)
+The project will enforce quality gates:
+   1. Format & Lint: cargo fmt and cargo clippy (strict mode).
+   2. Test Coverage: cargo tarpaulin to ensure unit test coverage matches or exceeds the legacy suite.
+   3. Schema Check: sea-orm-cli verification to ensure the Rust entities are still synchronized with the production MySQL schema.
+8. Gap Analysis and Integration of Missing Requirements
+The analysis of the research snippets reveals certain gaps that this report has addressed through inference and standard architectural patterns:
+   1. Exact Database Schema: The snippets do not provide the SQL DDL. Integration: The report specifies the use of SeaORM's "Database-First" generation tool to discover this schema automatically, removing the need for prior knowledge.
+   2. Authentication Mechanism: The specific auth provider (LDAP/AD) is mentioned generally. Integration: The report assumes standard Active Directory integration and proposes a JWT bridge to facilitate the React frontend migration.
+   3. Specific Bioinformatics Pipelines: The downstream consumers of Pinery are not detailed. Integration: The report treats Pinery as a "black box" API contract (Swagger) that must be strictly adhered to, ensuring compatibility regardless of the downstream tool (e.g., Nextflow, Snakemake).
+9. Conclusion
+The construction of Helix-LIMS represents a strategic investment in the longevity and reliability of the genomic sequencing facility. By moving from a legacy Java monolith to a modern, memory-safe Rust architecture, the facility gains:
+   * Resilience: Elimination of GC-induced pauses in critical monitoring services.
+   * Safety: Compile-time enforcement of laboratory protocols and states.
+   * Performance: A reporting layer (Pinery-Rust) capable of handling the high concurrency of automated pipelines.
+This report establishes that building a "viable alternative" is not only possible but can be executed with minimal risk through the Strangler Fig pattern and Shadow Testing. The parallel existence of Helix-LIMS alongside MISO provides the ultimate redundancy—a heterogenous environment where the strengths of the new system support the stability of the old, until the new becomes the standard.
+Recommended Implementation Roadmap
+Phase
+	Action Item
+	Success Criteria
+	0. Discovery
+	Run sea-orm-cli against MISO DB; Map entities.
+	Generated Rust structs match MySQL tables.
+	1. Foundation
+	Deploy Envoy Proxy in front of MISO.
+	No user-perceptible change in latency/behavior.
+	2. Read-Only
+	Implement Pinery API in Rust (Axum). Route /pinery to Rust.
+	Bioinformatics pipelines run successfully against Rust API.
+	3. Scanner
+	Build Rust Run Scanner with notify and bindgen. Run in "Dry Run" mode.
+	Scanner logs match MISO logs for run detection timestamps.
+	4. Shadow
+	Enable Traffic Mirroring for Write APIs.
+	Diffy reports 100% parity between MISO and Helix responses.
+	5. Cutover
+	Gradual migration of write traffic to Helix-LIMS.
+	Helix-LIMS becomes the primary system of record.
+	This blueprint provides the comprehensive technical and operational guide required to execute this ambitious but necessary transition.
+Works cited
+   1. High-Performance Sequencing - Earlham Institute, accessed December 15, 2025, https://www.earlham.ac.uk/high-performance-sequencing
+   2. What does 1.0 take? MISO-LIMS after 9 years... | Slides - F1000Research, accessed December 15, 2025, https://f1000research.com/slides/8-1386
+   3. International collaboration cooks up powerful new software: MISO - Ontario Institute for Cancer Research, accessed December 15, 2025, https://oicr.on.ca/international-collaboration-cooks-up-powerful-new-software-miso/
+   4. The Rust Revolution in Engineering Systems: Real-World Examples from the Lab to the Factory Floor - JKI, accessed December 15, 2025, https://www.jki.net/blog/the-rust-revolution-in-engineering-systems-real-world-examples-from-the-lab-to-the-factory-floor
+   5. Rust for Java developers - codecentric AG, accessed December 15, 2025, https://www.codecentric.de/en/knowledge-hub/blog/rust-for-java-developers
+   6. Rust Programming Language, accessed December 15, 2025, https://rust-lang.org/
+   7. MISO LIMS - GitHub, accessed December 15, 2025, https://github.com/miso-lims
+   8. miso-lims/runscanner: Monitors directories on the file system containing the output from sequencing instruments (e.g. Illumina) and reports their status and metrics - GitHub, accessed December 15, 2025, https://github.com/miso-lims/runscanner
+   9. Rust vs Java: A Staff Engineer's perspective - Reddit, accessed December 15, 2025, https://www.reddit.com/r/rust/comments/101gpgm/rust_vs_java_a_staff_engineers_perspective/
+   10. Discussion: My Experience with Java (Spring Boot) After Working with Rust and Go - Reddit, accessed December 15, 2025, https://www.reddit.com/r/learnjava/comments/1ox6zps/discussion_my_experience_with_java_spring_boot/
+   11. Illumina InterOp Documentation, accessed December 15, 2025, https://illumina.github.io/interop/index.html
+   12. C++ Library to parse Illumina InterOp files - GitHub, accessed December 15, 2025, https://github.com/Illumina/interop
+   13. FFI - The Rustonomicon - Rust Documentation, accessed December 15, 2025, https://doc.rust-lang.org/nomicon/ffi.html
+   14. Rust/C++ Interop Part 1 - Just the Basics - Tyler Weaver, accessed December 15, 2025, https://tylerjw.dev/posts/rust-cpp-interop/
+   15. Strangler Fig Pattern - Azure Architecture Center | Microsoft Learn, accessed December 15, 2025, https://learn.microsoft.com/en-us/azure/architecture/patterns/strangler-fig
+   16. Shadow Testing - Engineering Fundamentals Playbook, accessed December 15, 2025, https://microsoft.github.io/code-with-engineering-playbook/automated-testing/shadow-testing/
+   17. Strangler fig pattern - AWS Prescriptive Guidance, accessed December 15, 2025, https://docs.aws.amazon.com/prescriptive-guidance/latest/cloud-design-patterns/strangler-fig.html
+   18. Getting Started with MISO - MISO LIMS, accessed December 15, 2025, https://miso-lims.github.io/walkthroughs/
+   19. Samples Tutorial - MISO LIMS, accessed December 15, 2025, https://miso-lims.github.io/walkthroughs/tutorial-detailed-samples
+   20. MetaLIMS, a simple open-source laboratory information management system for small metagenomic labs - PMC - NIH, accessed December 15, 2025, https://pmc.ncbi.nlm.nih.gov/articles/PMC5449644/
+   21. Compare with Diesel | SeaORM An async & dynamic ORM for Rust - SeaQL, accessed December 15, 2025, https://www.sea-ql.org/SeaORM/docs/0.5.x/internal-design/diesel/
+   22. MISO: Managing information for sequencing operations - F1000, accessed December 15, 2025, https://f1000research-files.f1000.com/posters/compressed/f1000research-258413.pdf?_ga=undefined
+   23. MISO-lims - Ontario Institute for Cancer Research, accessed December 15, 2025, https://oicr.on.ca/wp-content/uploads/2024/06/OJGP-MISO.pdf
+   24. Q: What is pinery-miso? · Issue #1388 - GitHub, accessed December 15, 2025, https://github.com/TGAC/miso-lims/issues/1388
+   25. What are your favorite (simple) Open Source tools written in Rust? - Reddit, accessed December 15, 2025, https://www.reddit.com/r/rust/comments/16g38gp/what_are_your_favorite_simple_open_source_tools/
+   26. Rust vs. Java: A Comprehensive Comparison of Memory‑Safe Programming for Secure, High‑Performance Systems - Cogent University, accessed December 15, 2025, https://www.cogentuniversity.com/post/rust-vs-java-a-comprehensive-comparison-of-memory-safe-programming-for-secure-high-performance-systems
+   27. The Web Development Showdown: Is Rust Ready to Challenge Node, Python, Go & Java ? | by Utsav Madaan | Stackademic, accessed December 15, 2025, https://blog.stackademic.com/the-web-development-showdown-is-rust-ready-to-challenge-node-python-go-java-e22c711bd071
+   28. Diesel vs SeaORM Navigating Compile-Time vs Dynamic ORMs in Rust | Leapcell, accessed December 15, 2025, https://leapcell.io/blog/diesel-vs-seaorm-navigating-compile-time-vs-dynamic-orms-in-rust
+   29. Rust-Bio: a fast and safe bioinformatics library - Oxford Academic, accessed December 15, 2025, https://academic.oup.com/bioinformatics/article/32/3/444/1743419
+   30. cxx - Rust - Docs.rs, accessed December 15, 2025, https://docs.rs/cxx
+   31. Packages, Crates, and Modules - The Rust Programming Language, accessed December 15, 2025, https://doc.rust-lang.org/book/ch07-00-managing-growing-projects-with-packages-crates-and-modules.html
+   32. A Guide to Rust ORMs in 2025 - Shuttle.dev, accessed December 15, 2025, https://www.shuttle.dev/blog/2024/01/16/best-orm-rust
+   33. My take on databases with Rust (sea-orm vs. diesel vs. sqlx) - Reddit, accessed December 15, 2025, https://www.reddit.com/r/rust/comments/1e8ld5d/my_take_on_databases_with_rust_seaorm_vs_diesel/
+   34. rust-lang/rust-bindgen: Automatically generates Rust FFI bindings to C (and some C++) libraries. - GitHub, accessed December 15, 2025, https://github.com/rust-lang/rust-bindgen
+   35. rustybam | bioinformatics toolkit in rust - GitHub Pages, accessed December 15, 2025, https://mrvollger.github.io/rustybam/
+   36. Envoy Proxy's Traffic Mirroring Functionality | by Jude Dsouza | Medium, accessed December 15, 2025, https://medium.com/@dsouza_jude/envoy-proxys-traffic-mirroring-functionality-a54d34c5fbae
+   37. Migrating from ingress-nginx to Envoy Gateway - Tetrate, accessed December 15, 2025, https://tetrate.io/blog/migrating-from-ingress-nginx-to-envoy-gateway
+   38. Microservice Integration Testing a Pain? Try Shadow Testing - The New Stack, accessed December 15, 2025, https://thenewstack.io/microservice-integration-testing-a-pain-try-shadow-testing/
+   39. Dual Write - Legacy-Modernization.io, accessed December 15, 2025, https://legacy-modernization.io/patterns/data-synchronisation/dual-write/
+   40. What Is Change Data Capture (CDC)? - Confluent, accessed December 15, 2025, https://www.confluent.io/learn/change-data-capture/
+   41. A practical guide to real-time CDC with MySQL - Tinybird, accessed December 15, 2025, https://www.tinybird.co/blog/mysql-cdc
+   42. Chapter 2. Debezium Connector for MySQL - Red Hat Documentation, accessed December 15, 2025, https://docs.redhat.com/en/documentation/red_hat_integration/2020-q2/html/debezium_user_guide/debezium-connector-for-mysql
+   43. Building a Real-Time Data Pipeline Using MySQL, Debezium, Apache Kafka, and ClickHouse (Looking for Feedback) : r/dataengineering - Reddit, accessed December 15, 2025, https://www.reddit.com/r/dataengineering/comments/1h2s7ez/building_a_realtime_data_pipeline_using_mysql/
+   44. Refactoring Legacy JSP Apps to React: What We Gained and What Broke - Medium, accessed December 15, 2025, https://medium.com/@maanvik.gupta25/refactoring-legacy-jsp-apps-to-react-what-we-gained-and-what-broke-3cc74d315805
+   45. MISO: An open-source LIMS for NGS sequencing centres - GitHub, accessed December 15, 2025, https://github.com/miso-lims/miso-lims
+   46. metrics - Rust - Docs.rs, accessed December 15, 2025, https://docs.rs/metrics

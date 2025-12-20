@@ -1,0 +1,110 @@
+# MISO LIMS Docker Compose Configuration
+# Development environment with MySQL database
+
+version: '3.8'
+
+services:
+  # MySQL Database
+  db:
+    image: mysql:8.0
+    container_name: miso-db
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MYSQL_DATABASE: miso
+      MYSQL_USER: miso
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_root_password
+      - db_password
+    volumes:
+      - miso-db-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    networks:
+      - miso-network
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Database Migrations
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miso-migrate
+    command: ["./miso-migrate", "up"]
+    environment:
+      DATABASE_URL: mysql://miso:miso@db:3306/miso
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - miso-network
+
+  # API Server
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: miso-api
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: mysql://miso:miso@db:3306/miso
+      JWT_SECRET_FILE: /run/secrets/jwt_secret
+      HOST: "0.0.0.0"
+      PORT: "8080"
+      LOG_LEVEL: "info"
+      CORS_ENABLED: "true"
+    secrets:
+      - jwt_secret
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - miso-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+
+  # Nginx Reverse Proxy (optional, for production)
+  nginx:
+    image: nginx:alpine
+    container_name: miso-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - api
+    networks:
+      - miso-network
+    profiles:
+      - production
+
+networks:
+  miso-network:
+    driver: bridge
+
+volumes:
+  miso-db-data:
+
+secrets:
+  db_root_password:
+    file: ./secrets/db_root_password.txt
+  db_password:
+    file: ./secrets/db_password.txt
+  jwt_secret:
+    file: ./secrets/jwt_secret.txt
+

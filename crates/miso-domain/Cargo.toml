@@ -1,0 +1,19 @@
+[package]
+name = "miso-domain"
+description = "Core domain entities, value objects, and repository traits for MISO LIMS"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# The domain layer is PURE - no database or web framework dependencies
+thiserror.workspace = true
+serde.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+async-trait.workspace = true
+validator.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+

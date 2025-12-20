@@ -1,0 +1,18 @@
+[package]
+name = "miso-migration"
+description = "Database migrations for MISO LIMS"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[[bin]]
+name = "miso-migrate"
+path = "src/main.rs"
+
+[dependencies]
+sea-orm-migration.workspace = true
+tokio.workspace = true
+dotenvy.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+

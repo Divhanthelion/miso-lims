@@ -1,0 +1,97 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/miso-domain",
+    "crates/miso-application",
+    "crates/miso-infrastructure",
+    "crates/miso-api",
+    "crates/miso-frontend",
+    "crates/miso-migration",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+license = "GPL-3.0"
+authors = ["MISO LIMS Contributors"]
+repository = "https://github.com/miso-lims/miso-lims-rust"
+
+[workspace.dependencies]
+# Async Runtime
+tokio = { version = "1.42", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+
+# Web Framework
+axum = { version = "0.8", features = ["macros"] }
+axum-extra = { version = "0.10", features = ["typed-header", "cookie"] }
+tower = { version = "0.5", features = ["full"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "compression-gzip"] }
+
+# Database ORM
+sea-orm = { version = "1.1", features = [
+    "sqlx-mysql",
+    "runtime-tokio-rustls",
+    "macros",
+    "with-chrono",
+    "with-uuid",
+    "with-json",
+] }
+sea-orm-migration = { version = "1.1" }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Error Handling
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Async Traits
+async-trait = "0.1"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+# Logging/Tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Validation
+validator = { version = "0.19", features = ["derive"] }
+
+# Password Hashing
+argon2 = "0.5"
+
+# JWT
+jsonwebtoken = "9.3"
+
+# LDAP
+ldap3 = "0.11"
+
+# Authorization (RBAC)
+casbin = "2.3"
+
+# Bioinformatics
+bio = "2.0"
+
+# ZPL Printing
+# zpl = "0.1"
+
+# Configuration
+config = "0.14"
+dotenvy = "0.15"
+
+# Testing
+mockall = "0.13"
+
+# Internal crates
+miso-domain = { path = "crates/miso-domain" }
+miso-application = { path = "crates/miso-application" }
+miso-infrastructure = { path = "crates/miso-infrastructure" }
+miso-api = { path = "crates/miso-api" }
+miso-migration = { path = "crates/miso-migration" }
+

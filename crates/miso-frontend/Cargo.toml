@@ -1,0 +1,20 @@
+[package]
+name = "miso-frontend"
+description = "Leptos WASM frontend for MISO LIMS"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# Note: Leptos requires specific setup - this is a placeholder
+# leptos = { version = "0.6", features = ["csr", "nightly"] }
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+hydrate = []
+ssr = []
+

@@ -1,0 +1,38 @@
+[package]
+name = "miso-application"
+description = "Application layer with use cases and services for MISO LIMS"
+version.workspace = true
+edition = "2021"
+license.workspace = true
+
+[dependencies]
+# Internal
+miso-domain.workspace = true
+
+# Async
+tokio.workspace = true
+async-trait.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Error handling
+thiserror.workspace = true
+anyhow.workspace = true
+
+# Date/Time
+chrono.workspace = true
+
+# UUID
+uuid.workspace = true
+
+# Logging
+tracing.workspace = true
+
+# Validation
+validator.workspace = true
+
+[dev-dependencies]
+mockall.workspace = true
+
